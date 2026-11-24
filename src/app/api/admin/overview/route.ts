@@ -40,8 +40,18 @@ export async function GET(request: NextRequest) {
       }),
       prisma.batch.findMany({
         orderBy: { createdAt: 'desc' },
-        take: 20,
+        take: 30,
         include: {
+          codes: {
+            select: {
+              id: true,
+              code: true,
+              status: true,
+              redeemedAt: true,
+              createdAt: true,
+            },
+            orderBy: { createdAt: 'asc' },
+          },
           _count: {
             select: { codes: true },
           },
@@ -49,7 +59,7 @@ export async function GET(request: NextRequest) {
       }),
       prisma.rewardRedemption.findMany({
         orderBy: { createdAt: 'desc' },
-        take: 20,
+        take: 25,
         include: {
           customer: {
             select: {
@@ -69,7 +79,7 @@ export async function GET(request: NextRequest) {
       }),
       prisma.fraudLog.findMany({
         orderBy: { createdAt: 'desc' },
-        take: 30,
+        take: 40,
       }),
     ])
 
@@ -88,15 +98,25 @@ export async function GET(request: NextRequest) {
           totalPointsSpent,
           currentOutstandingPoints: totalPointsIssued - totalPointsSpent,
         },
-        batches: batches.map((b) => ({
-          id: b.id,
-          name: b.name,
-          productName: b.productName,
-          pointsPerCode: b.pointsPerCode,
-          quantity: b.quantity,
-          codesCount: b._count.codes,
-          createdAt: b.createdAt,
-        })),
+        batches: batches.map((b) => {
+          const claimed = b.codes.filter((c) => c.status === 'REDEEMED').length
+          const unclaimed = b.codes.filter((c) => c.status === 'UNCLAIMED').length
+          const revoked = b.codes.filter((c) => c.status === 'REVOKED').length
+
+          return {
+            id: b.id,
+            name: b.name,
+            productName: b.productName,
+            pointsPerCode: b.pointsPerCode,
+            quantity: b.quantity,
+            codesCount: b._count.codes,
+            claimedCount: claimed,
+            unclaimedCount: unclaimed,
+            revokedCount: revoked,
+            codes: b.codes,
+            createdAt: b.createdAt,
+          }
+        }),
         recentRedemptions,
         recentFraudLogs,
       },

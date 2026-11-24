@@ -47,7 +47,7 @@ async function main() {
 
   if (isDbConnected) {
     console.log('\n[MODE: LIVE POSTGRESQL DATABASE]')
-    console.log('Connected to PostgreSQL via DATABASE_URL. Running against live database.\n')
+    console.log('Connected to PostgreSQL via DATABASE_URL. Running all 10 tests against database...\n')
     await runLiveE2ETests()
   } else {
     console.log('\n[MODE: IN-MEMORY ENGINE & CONTRACT VERIFICATION]')
@@ -58,18 +58,24 @@ async function main() {
 }
 
 // -------------------------------------------------------------------------
-// Live Database Tests
+// Live Database Tests (All 10 Scenarios)
 // -------------------------------------------------------------------------
 async function runLiveE2ETests() {
-  // Test 1: Admin Batch Creation
+  const timestamp = Date.now()
+  const testContact = `worker_${timestamp}@factory.internal`
+  const testName = 'John Maintenance'
+
+  // -------------------------------------------------------------
+  // Test 1: Admin Batch Creation & Cryptographic Code Generation
+  // -------------------------------------------------------------
   console.log('--- TEST 1: Admin Batch Creation (POST /api/admin/batches) ---')
   const batchReq = new NextRequest('http://localhost:3000/api/admin/batches', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-admin-passcode': ADMIN_PASSCODE },
     body: JSON.stringify({
-      name: 'BATCH-2026-ALPHA',
+      name: `BATCH-${timestamp}-ALPHA`,
       productName: 'Heavy-Duty Industrial Bearings (Pack of 10)',
-      pointsPerCode: 50,
+      pointsPerCode: 100,
       quantity: 10,
     }),
   })
@@ -82,10 +88,10 @@ async function runLiveE2ETests() {
   const createdCodes = await prisma.boxCode.findMany({ where: { batchId: batchData.batch.id }, take: 5 })
   const codeToClaim = createdCodes[0].code
   const codeToRevoke = createdCodes[1].code
-  const testContact = `worker_${Date.now()}@factory.internal`
-  const testName = 'John Maintenance'
 
-  // Test 2: Valid Claim
+  // -------------------------------------------------------------
+  // Test 2: Valid Code Claim
+  // -------------------------------------------------------------
   console.log('\n--- TEST 2: Valid Code Claim (POST /api/codes/claim) ---')
   const claimReq = new NextRequest('http://localhost:3000/api/codes/claim', {
     method: 'POST',
@@ -94,22 +100,32 @@ async function runLiveE2ETests() {
   })
   const claimRes = await claimRoute.POST(claimReq)
   const claimData = await claimRes.json()
-  if (claimRes.status !== 200 || claimData.customer.pointsBalance !== 50) {
-    throw new Error(`Test 2 Failed: ${JSON.stringify(claimData)}`)
+  if (claimRes.status !== 200 || claimData.customer.pointsBalance !== 100) {
+    throw new Error(`Test 2 Failed: Expected 100 points balance, got: ${JSON.stringify(claimData)}`)
   }
-  console.log(`[PASS] Points balance incremented to: ${claimData.customer.pointsBalance}`)
+  console.log(`[PASS] Valid code claimed: added 100 points (Balance: ${claimData.customer.pointsBalance})`)
 
+  // -------------------------------------------------------------
   // Test 3: Duplicate Code Fraud Prevention
-  console.log('\n--- TEST 3: Duplicate Code Fraud Prevention ---')
-  const dupRes = await claimRoute.POST(claimReq)
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 3: Duplicate Code Fraud Prevention (POST /api/codes/claim) ---')
+  // Fresh NextRequest so the request body stream is unconsumed
+  const dupClaimReq = new NextRequest('http://localhost:3000/api/codes/claim', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: codeToClaim, name: testName, contact: testContact }),
+  })
+  const dupRes = await claimRoute.POST(dupClaimReq)
   const dupData = await dupRes.json()
   if (dupRes.status !== 409 || dupData.reason !== 'ALREADY_REDEEMED') {
-    throw new Error(`Test 3 Failed: ${JSON.stringify(dupData)}`)
+    throw new Error(`Test 3 Failed: Expected HTTP 409 ALREADY_REDEEMED, got ${dupRes.status}: ${JSON.stringify(dupData)}`)
   }
   console.log(`[PASS] Duplicate claim rejected with HTTP 409 (Reason: ${dupData.reason})`)
 
+  // -------------------------------------------------------------
   // Test 4: Invalid Code Fraud Prevention
-  console.log('\n--- TEST 4: Invalid Code Fraud Prevention ---')
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 4: Invalid Code Fraud Prevention (POST /api/codes/claim) ---')
   const invReq = new NextRequest('http://localhost:3000/api/codes/claim', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -118,18 +134,25 @@ async function runLiveE2ETests() {
   const invRes = await claimRoute.POST(invReq)
   const invData = await invRes.json()
   if (invRes.status !== 400 || invData.reason !== 'INVALID_CODE') {
-    throw new Error(`Test 4 Failed: ${JSON.stringify(invData)}`)
+    throw new Error(`Test 4 Failed: Expected HTTP 400 INVALID_CODE, got ${invRes.status}: ${JSON.stringify(invData)}`)
   }
   console.log(`[PASS] Invalid code rejected with HTTP 400 (Reason: ${invData.reason})`)
 
+  // -------------------------------------------------------------
   // Test 5: Revoked Code Fraud Prevention
-  console.log('\n--- TEST 5: Revoked Code Fraud Prevention ---')
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 5: Revoked Code Fraud Prevention (PATCH admin + claim) ---')
   const patchReq = new NextRequest(`http://localhost:3000/api/admin/codes/${codeToRevoke}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json', 'x-admin-passcode': ADMIN_PASSCODE },
     body: JSON.stringify({ action: 'REVOKE' }),
   })
-  await adminCodeRoute.PATCH(patchReq, { params: Promise.resolve({ id: codeToRevoke }) })
+  const patchRes = await adminCodeRoute.PATCH(patchReq, { params: Promise.resolve({ id: codeToRevoke }) })
+  const patchData = await patchRes.json()
+  if (patchRes.status !== 200 || patchData.code.status !== 'REVOKED') {
+    throw new Error(`Test 5 Failed: Could not revoke code: ${JSON.stringify(patchData)}`)
+  }
+  console.log(`[PASS] Box code ${codeToRevoke} status set to REVOKED by admin`)
 
   const revokedClaimReq = new NextRequest('http://localhost:3000/api/codes/claim', {
     method: 'POST',
@@ -139,68 +162,126 @@ async function runLiveE2ETests() {
   const revokedClaimRes = await claimRoute.POST(revokedClaimReq)
   const revokedClaimData = await revokedClaimRes.json()
   if (revokedClaimRes.status !== 400 || revokedClaimData.reason !== 'REVOKED_CODE') {
-    throw new Error(`Test 5 Failed: ${JSON.stringify(revokedClaimData)}`)
+    throw new Error(`Test 5 Failed: Expected HTTP 400 REVOKED_CODE, got ${revokedClaimRes.status}: ${JSON.stringify(revokedClaimData)}`)
   }
   console.log(`[PASS] Revoked code rejected with HTTP 400 (Reason: ${revokedClaimData.reason})`)
 
-  // Test 6: Rate Limiting
-  console.log('\n--- TEST 6: Rate Limiting Enforcement ---')
-  const attacker = `attacker_${Date.now()}@bad.org`
+  // -------------------------------------------------------------
+  // Test 6: Rate Limiting Enforcement (>= 5 failed attempts)
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 6: Rate Limiting Enforcement (5+ failed attempts) ---')
+  const attackerContact = `attacker_${timestamp}@suspicious.org`
   for (let i = 1; i <= 5; i++) {
     const spamReq = new NextRequest('http://localhost:3000/api/codes/claim', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code: `BOX-SPAM-${i}`, name: 'Spam', contact: attacker }),
+      body: JSON.stringify({ code: `BOX-SPAM-${i}`, name: 'Spam', contact: attackerContact }),
     })
     await claimRoute.POST(spamReq)
   }
   const blockedReq = new NextRequest('http://localhost:3000/api/codes/claim', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code: 'BOX-SPAM-6', name: 'Spam', contact: attacker }),
+    body: JSON.stringify({ code: 'BOX-SPAM-6', name: 'Spam', contact: attackerContact }),
   })
   const blockedRes = await claimRoute.POST(blockedReq)
   const blockedData = await blockedRes.json()
   if (blockedRes.status !== 429 || blockedData.reason !== 'RATE_LIMITED') {
-    throw new Error(`Test 6 Failed: ${JSON.stringify(blockedData)}`)
+    throw new Error(`Test 6 Failed: Expected HTTP 429 RATE_LIMITED, got ${blockedRes.status}: ${JSON.stringify(blockedData)}`)
   }
   console.log(`[PASS] Rate limit triggered: HTTP 429 Too Many Requests (Reason: ${blockedData.reason})`)
 
-  // Test 7: Customer Profile
-  console.log('\n--- TEST 7: Customer Profile (GET /api/customer) ---')
+  // -------------------------------------------------------------
+  // Test 7: Customer Profile & History (GET /api/customer)
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 7: Customer Profile & Catalog (GET /api/customer) ---')
   const custReq = new NextRequest(`http://localhost:3000/api/customer?contact=${encodeURIComponent(testContact)}`, {
     method: 'GET',
   })
   const custRes = await customerRoute.GET(custReq)
   const custData = await custRes.json()
-  if (custRes.status !== 200 || !custData.claimedBoxes.length) throw new Error(`Test 7 Failed`)
+  if (custRes.status !== 200 || !custData.claimedBoxes.length) {
+    throw new Error(`Test 7 Failed: ${JSON.stringify(custData)}`)
+  }
   console.log(`[PASS] Customer profile verified (Claimed boxes: ${custData.claimedBoxes.length})`)
+  console.log(`[PASS] Available rewards catalog: ${custData.availableRewards.length} items`)
 
-  // Test 8: Reward Redemption
-  console.log('\n--- TEST 8: Atomic Reward Redemption ---')
-  const reward = custData.availableRewards[0]
+  // -------------------------------------------------------------
+  // Test 8: Atomic Reward Redemption (POST /api/rewards/redeem)
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 8: Atomic Reward Redemption (POST /api/rewards/redeem) ---')
+  // Find a reward costing <= customer's 100 points
+  let rewardToRedeem = custData.availableRewards.find((r: any) => r.pointsCost <= 100 && r.stock > 0)
+  if (!rewardToRedeem) {
+    rewardToRedeem = await prisma.rewardItem.create({
+      data: {
+        title: 'Factory Safety Goggles',
+        description: 'Anti-fog industrial protective safety goggles',
+        pointsCost: 100,
+        stock: 20,
+        active: true,
+      },
+    })
+  }
+
+  const prevStock = rewardToRedeem.stock
   const redeemReq = new NextRequest('http://localhost:3000/api/rewards/redeem', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ contact: testContact, rewardId: reward.id }),
+    body: JSON.stringify({ contact: testContact, rewardId: rewardToRedeem.id }),
   })
   const redeemRes = await redeemRoute.POST(redeemReq)
   const redeemData = await redeemRes.json()
-  console.log(`[PASS] Reward redemption test completed with status: ${redeemRes.status}`)
+  if (redeemRes.status !== 200) {
+    throw new Error(`Test 8 Failed: Expected HTTP 200, got ${redeemRes.status}: ${JSON.stringify(redeemData)}`)
+  }
+  console.log(`[PASS] Reward redeemed successfully: ${redeemData.redemption.reward.title}`)
+  console.log(`[PASS] Points deducted atomically: remaining balance is ${redeemData.customer.pointsBalance}`)
 
-  // Test 9: Admin Overview
-  console.log('\n--- TEST 9: Admin Overview Metrics ---')
+  const refreshedReward = await prisma.rewardItem.findUnique({ where: { id: rewardToRedeem.id } })
+  if (refreshedReward?.stock !== prevStock - 1) {
+    throw new Error(`Test 8 Failed: Stock was not decremented (${prevStock} -> ${refreshedReward?.stock})`)
+  }
+  console.log(`[PASS] Reward stock decremented from ${prevStock} to ${refreshedReward?.stock}`)
+
+  // -------------------------------------------------------------
+  // Test 9: Insufficient Points Rejection
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 9: Insufficient Points Rejection (POST /api/rewards/redeem) ---')
+  const insufficientReq = new NextRequest('http://localhost:3000/api/rewards/redeem', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ contact: testContact, rewardId: rewardToRedeem.id }),
+  })
+  const insufficientRes = await redeemRoute.POST(insufficientReq)
+  const insufficientData = await insufficientRes.json()
+  if (insufficientRes.status !== 400) {
+    throw new Error(`Test 9 Failed: Expected HTTP 400 for insufficient points, got ${insufficientRes.status}: ${JSON.stringify(insufficientData)}`)
+  }
+  console.log(`[PASS] Insufficient points redemption correctly rejected with HTTP 400: "${insufficientData.error}"`)
+
+  // -------------------------------------------------------------
+  // Test 10: Admin Dashboard Overview Metrics (GET /api/admin/overview)
+  // -------------------------------------------------------------
+  console.log('\n--- TEST 10: Admin Dashboard Overview Metrics (GET /api/admin/overview) ---')
   const ovReq = new NextRequest('http://localhost:3000/api/admin/overview', {
     method: 'GET',
     headers: { 'x-admin-passcode': ADMIN_PASSCODE },
   })
   const ovRes = await adminOverviewRoute.GET(ovReq)
   const ovData = await ovRes.json()
-  if (ovRes.status !== 200) throw new Error(`Test 9 Failed`)
-  console.log(`[PASS] Overview metrics verified. Total codes in system: ${ovData.metrics.totalCodes}`)
+  if (ovRes.status !== 200) throw new Error(`Test 10 Failed: ${JSON.stringify(ovData)}`)
+  console.log(`[PASS] Admin metrics:`)
+  console.log(`       Total Codes in DB:   ${ovData.metrics.totalCodes}`)
+  console.log(`       Redeemed Codes:      ${ovData.metrics.redeemedCount}`)
+  console.log(`       Unclaimed Codes:     ${ovData.metrics.unclaimedCount}`)
+  console.log(`       Revoked Codes:       ${ovData.metrics.revokedCount}`)
+  console.log(`       Active Customers:    ${ovData.metrics.activeCustomers}`)
+  console.log(`       Total Points Issued: ${ovData.metrics.totalPointsIssued}`)
+  console.log(`       Total Points Spent:  ${ovData.metrics.totalPointsSpent}`)
 
   console.log('\n' + '='.repeat(75))
-  console.log('ALL LIVE VERIFICATION TESTS PASSED SUCCESSFULLY!')
+  console.log('ALL 10 LIVE VERIFICATION TESTS PASSED SUCCESSFULLY!')
   console.log('='.repeat(75))
 }
 
@@ -250,7 +331,6 @@ async function runInMemoryEngineTests() {
   // 2. Business Logic Simulation
   console.log('\n--- SUITE B: Factory Loyalty Logic & Fraud Prevention Verification ---')
 
-  // In-memory state store
   const state = {
     batches: [] as any[],
     codes: new Map<string, any>(),
@@ -285,7 +365,6 @@ async function runInMemoryEngineTests() {
     fraudLogs: [] as any[],
   }
 
-  // Step 1: Batch creation & code generation test
   const testQuantity = 20
   const generatedCodes = generateUniqueBoxCodes(testQuantity)
   if (generatedCodes.length !== testQuantity) throw new Error('Unique code generation count mismatch')
@@ -320,17 +399,14 @@ async function runInMemoryEngineTests() {
   }
   console.log(`[PASS] Batch '${batch.name}' registered with 3 default seeded reward items`)
 
-  // Step 2: Valid Claim Simulation
   const validCode = generatedCodes[0]
   const customerContact = 'operator_smith@factory.internal'
   const customerName = 'John Smith'
 
-  // Simulate claim transaction
   function simulateClaim(code: string, name: string, contact: string) {
     const normCode = normalizeCode(code)
     const normContact = normalizeContact(contact)
 
-    // Rate-limit check: 5 failed attempts in last 10 minutes
     const tenMinAgo = Date.now() - 10 * 60 * 1000
     const recentFails = state.fraudLogs.filter(
       (f) => f.contact === normContact && f.createdAt.getTime() >= tenMinAgo
@@ -347,7 +423,6 @@ async function runInMemoryEngineTests() {
       return { status: 429, error: 'Rate limit exceeded: 5 or more failed claim attempts', reason: 'RATE_LIMITED' }
     }
 
-    // Atomic claim check
     const box = state.codes.get(normCode)
     if (!box || box.status !== 'UNCLAIMED') {
       let reason: string = 'INVALID_CODE'
@@ -373,7 +448,6 @@ async function runInMemoryEngineTests() {
       return { status, error: `Claim rejected: ${reason}`, reason }
     }
 
-    // Success
     box.status = 'REDEEMED'
     box.redeemedAt = new Date()
 
@@ -407,21 +481,18 @@ async function runInMemoryEngineTests() {
   console.log(`[PASS] Valid code claim: added ${validClaimResult.pointsEarned} points to customer`)
   console.log(`[PASS] Customer balance: ${validClaimResult.customer?.pointsBalance} points (Total earned: ${validClaimResult.customer?.totalEarned})`)
 
-  // Step 3: Duplicate claim prevention
   const dupClaimResult = simulateClaim(validCode, 'Another Worker', 'other@factory.internal')
   if (dupClaimResult.status !== 409 || dupClaimResult.reason !== 'ALREADY_REDEEMED') {
     throw new Error('Duplicate claim test failed')
   }
   console.log(`[PASS] Duplicate code claim correctly caught: HTTP 409 (Reason: ${dupClaimResult.reason})`)
 
-  // Step 4: Invalid code claim
   const invClaimResult = simulateClaim('BOX-FAKE-0000', customerName, customerContact)
   if (invClaimResult.status !== 400 || invClaimResult.reason !== 'INVALID_CODE') {
     throw new Error('Invalid code test failed')
   }
   console.log(`[PASS] Non-existent code claim correctly caught: HTTP 400 (Reason: ${invClaimResult.reason})`)
 
-  // Step 5: Revoked code claim
   const codeToRevoke = generatedCodes[1]
   const boxToRevoke = state.codes.get(codeToRevoke)
   boxToRevoke.status = 'REVOKED'
@@ -433,7 +504,6 @@ async function runInMemoryEngineTests() {
   }
   console.log(`[PASS] Revoked code claim correctly rejected: HTTP 400 (Reason: ${revokedClaimResult.reason})`)
 
-  // Step 6: Rate limiting
   console.log('\n--- SUITE C: Rate Limiting Verification ---')
   const attackerContact = 'spammer@malicious.xyz'
   for (let i = 1; i <= 5; i++) {
@@ -446,7 +516,6 @@ async function runInMemoryEngineTests() {
   console.log(`[PASS] Rate limiter triggered after 5 failed attempts: HTTP 429 (Reason: ${rateLimitResult.reason})`)
   console.log(`[PASS] FraudLog entries recorded for contact: ${state.fraudLogs.filter((f) => f.contact === attackerContact).length}`)
 
-  // Step 7: Reward Redemption Simulation
   console.log('\n--- SUITE D: Atomic Reward Redemption & Stock Deduction ---')
   function simulateRedeem(contact: string, rewardId: string) {
     const customer = state.customers.get(normalizeContact(contact))
@@ -488,12 +557,10 @@ async function runInMemoryEngineTests() {
   console.log(`[PASS] Points deducted atomically: remaining balance is ${redeemResult.remainingBalance}`)
   console.log(`[PASS] Reward stock decremented from ${initialStock} to ${redeemResult.remainingStock}`)
 
-  // Step 8: Insufficient Points Rejection
   const failedRedeemResult = simulateRedeem(customerContact, rewardItem.id)
   if (failedRedeemResult.status !== 400) throw new Error('Insufficient points test failed')
   console.log(`[PASS] Attempt to redeem with insufficient points rejected with HTTP 400: "${failedRedeemResult.error}"`)
 
-  // Step 9: Metrics verification
   console.log('\n--- SUITE E: Admin Overview Metrics Calculation ---')
   const totalCodes = state.codes.size
   const redeemedCount = Array.from(state.codes.values()).filter((c) => c.status === 'REDEEMED').length
